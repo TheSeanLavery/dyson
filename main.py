@@ -41,6 +41,13 @@ ROT_SPEED = 2 * math.pi / 600.0
 EDGE_WIDTH, STAR_RADIUS, STAR_GLOW_RADIUS = 1, 8, 30
 BG_STAR_COUNT = 600
 
+# Face rendering
+FACE_EDGE_FRONT = (0, 255, 0)
+FACE_EDGE_BACK = (0, 200, 255)
+FACE_FILL_FRONT = (0, 255, 0, 80)
+FACE_FILL_BACK = (0, 200, 255, 45)
+DOUBLE_FACE_Z_OFFSET = 1e-4
+
 def generate_bg_stars(width: int, height: int, count: int) -> List[List[float]]:
     """Generate random background stars."""
     stars = []
@@ -107,6 +114,26 @@ def generate_lights_for_face(verts: np.ndarray, face_indices: List[int], count: 
         lights.append((pt, size, (random.randint(100, 200), random.randint(0, 30), random.randint(0, 30))))
     return lights
 
+def reverse_edge_flags(edge_flags: List[bool]) -> List[bool]:
+    """Re-map edge draw flags for a polygon whose winding has been reversed."""
+    if len(edge_flags) <= 1: return list(edge_flags)
+    return list(reversed(edge_flags[:-1])) + [edge_flags[-1]]
+
+def draw_translucent_polygon(surface: pygame.Surface, points: List[Tuple[float, float]], color: Tuple[int, int, int, int]) -> None:
+    """Draw a translucent polygon by rasterizing to a temporary alpha surface."""
+    if len(points) < 3: return
+    xs, ys = [p[0] for p in points], [p[1] for p in points]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    width = max(1, int(math.ceil(max_x - min_x)) + 4)
+    height = max(1, int(math.ceil(max_y - min_y)) + 4)
+    offset_x = int(math.floor(min_x)) - 2
+    offset_y = int(math.floor(min_y)) - 2
+    poly_surface = pygame.Surface((width, height), pygame.SRCALPHA)
+    offset_points = [(x - offset_x, y - offset_y) for x, y in points]
+    pygame.draw.polygon(poly_surface, color, offset_points)
+    surface.blit(poly_surface, (offset_x, offset_y))
+
 def project_points(points: np.ndarray):
     """Project 3D points to 2D screen space using Orthographic projection."""
     if len(points) == 0: return np.array([]), np.array([]), np.array([]), np.array([])
@@ -164,6 +191,7 @@ def main():
         pygame.draw.circle(screen, (255, 255, 255), center, STAR_RADIUS)
 
         render_list = []
+        light_draw_queue = []
         for verts_local, edges, faces_local, lights_local in segments:
             v_world = verts_local @ mat.T
             x2d, y2d, mask_v, _ = project_points(v_world)
@@ -180,16 +208,25 @@ def main():
                     lx, ly, _, _ = project_points(pts_world)
                     for j in range(len(lx)): proj_lights.append((lx[j], ly[j], lights_local[i][j][1], lights_local[i][j][2]))
                 
-                render_list.append((avg_z, 'face', points_2d, (0, 255, 0), edge_flags, proj_lights))
+                edge_flags_front = list(edge_flags)
+                render_list.append((avg_z, 'face', points_2d, FACE_EDGE_FRONT, edge_flags_front, proj_lights, False))
+                back_points = list(reversed(points_2d))
+                back_edge_flags = reverse_edge_flags(edge_flags_front)
+                render_list.append((avg_z - DOUBLE_FACE_Z_OFFSET, 'face', back_points, FACE_EDGE_BACK, back_edge_flags, proj_lights, True))
+                light_draw_queue.extend(proj_lights)
 
         render_list.sort(key=lambda x: x[0]) # Sort by depth
         
-        for _, type_, points, color, edge_flags, lights in render_list:
+        for _, type_, points, edge_color, edge_flags, lights, is_back in render_list:
             if type_ == 'face':
-                pygame.draw.polygon(screen, (0, 0, 0), points) # Draw filled polygon in black (occlusion)
-                for lx, ly, lsize, lcolor in lights: pygame.draw.circle(screen, lcolor, (int(lx), int(ly)), max(1, int(lsize)))
-                for k in range(len(points)):
-                    if edge_flags[k]: pygame.draw.line(screen, color, points[k], points[(k + 1) % len(points)], 1)
+                fill_color = FACE_FILL_BACK if is_back else FACE_FILL_FRONT
+                draw_translucent_polygon(screen, points, fill_color)
+                edge_count = min(len(points), len(edge_flags))
+                for k in range(edge_count):
+                    if edge_flags[k]: pygame.draw.line(screen, edge_color, points[k], points[(k + 1) % len(points)], 1)
+
+        for lx, ly, lsize, lcolor in light_draw_queue:
+            pygame.draw.circle(screen, lcolor, (int(lx), int(ly)), max(1, int(lsize)))
 
         info_text = [f"Rot X (Pitch): {math.degrees(view_pitch):.1f}°", f"Rot Y (Yaw):   {math.degrees(view_yaw):.1f}°", f"Rot Z (Spin):  {math.degrees(theta):.1f}°"]
         for i, line in enumerate(info_text): screen.blit(font.render(line, True, (0, 255, 255)), (10, 10 + i * 20))
