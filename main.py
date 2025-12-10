@@ -36,7 +36,7 @@ LIGHTS_PER_SEGMENT = 200
 # Camera / View
 SCALE, TILT = 52.5, math.radians(38)                    # Orthographic projection (no perspective)
 INITIAL_YAW, BASE_AZIM = math.radians(42), math.radians(45)
-ROT_SPEED = 2 * math.pi / 600.0
+ROT_SPEED = 35 * math.pi / 600.0
 
 EDGE_WIDTH, STAR_RADIUS, STAR_GLOW_RADIUS = 1, 8, 30
 BG_STAR_COUNT = 600
@@ -158,12 +158,13 @@ def main():
                 face_lights[f_idx].extend(generate_lights_for_face(v, f[f_idx][0], 1))
         segments.append((v, e, f, face_lights)) 
 
-    frame, view_pitch, view_yaw = 0, TILT, INITIAL_YAW
+    spin_angle, view_pitch, view_yaw = 0.0, TILT, INITIAL_YAW
     dragging, last_mouse_pos = False, (0, 0)
     bg_stars = generate_bg_stars(WIDTH, HEIGHT, BG_STAR_COUNT)
     
     running = True
     while running:
+        dt = clock.tick(FPS) * 0.001
         for event in pygame.event.get():
             if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE): running = False
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1: dragging, last_mouse_pos = True, event.pos
@@ -180,7 +181,8 @@ def main():
             b = s[3] / 255.0
             pygame.draw.circle(screen, (int(s[4][0] * b), int(s[4][1] * b), int(s[4][2] * b)), (s[0], s[1]), s[2])
 
-        theta = frame * ROT_SPEED + BASE_AZIM
+        spin_angle += ROT_SPEED * dt
+        theta = spin_angle + BASE_AZIM
         mat = rotation_matrix_y(view_yaw) @ rotation_matrix_x(view_pitch) @ rotation_matrix_z(theta)
         
         center = (WIDTH // 2, HEIGHT // 2)
@@ -192,6 +194,7 @@ def main():
 
         render_list = []
         light_draw_queue = []
+        edge_draw_queue = []
         for verts_local, edges, faces_local, lights_local in segments:
             v_world = verts_local @ mat.T
             x2d, y2d, mask_v, _ = project_points(v_world)
@@ -221,9 +224,13 @@ def main():
             if type_ == 'face':
                 fill_color = FACE_FILL_BACK if is_back else FACE_FILL_FRONT
                 draw_translucent_polygon(screen, points, fill_color)
-                edge_count = min(len(points), len(edge_flags))
-                for k in range(edge_count):
-                    if edge_flags[k]: pygame.draw.line(screen, edge_color, points[k], points[(k + 1) % len(points)], 1)
+                edge_draw_queue.append((edge_color, points, edge_flags))
+
+        for edge_color, points, edge_flags in edge_draw_queue:
+            edge_count = min(len(points), len(edge_flags))
+            for k in range(edge_count):
+                if edge_flags[k]:
+                    pygame.draw.line(screen, edge_color, points[k], points[(k + 1) % len(points)], 1)
 
         for lx, ly, lsize, lcolor in light_draw_queue:
             pygame.draw.circle(screen, lcolor, (int(lx), int(ly)), max(1, int(lsize)))
@@ -232,8 +239,6 @@ def main():
         for i, line in enumerate(info_text): screen.blit(font.render(line, True, (0, 255, 255)), (10, 10 + i * 20))
 
         pygame.display.flip()
-        frame += 1
-        clock.tick(FPS)
     pygame.quit()
 
 if __name__ == "__main__":
