@@ -66,7 +66,10 @@
       baseAzim: degToRad(45),
       rotSpeed: (35 * Math.PI) / 600.0,
       starGlowRadius: 30,
-      bgStarCount: 600,
+      bgStarCount: 60000,
+      fixedStarCount: 2000,
+      starCylinderRadius: 40, // much wider than ring (7.5)
+      starCylinderHeight: 2, // tall volume
       faceFillFront: [0 / 255, 255 / 255, 0 / 255, 80 / 255],
       faceFillBack: [0 / 255, 200 / 255, 255 / 255, 45 / 255],
       edgeColor: [0 / 255, 255 / 255, 0 / 255, 1],
@@ -87,6 +90,7 @@
     let spriteDataArray = null;
     let cityLightCount = 0;
     let bgStarCount = 0;
+    let fixedStarCount = 0;
     let faceRecords = [];
     let faceSortOrder = [];
     let faceVertexScratch = null;
@@ -95,6 +99,7 @@
     const sprites = {
       city: [],
       stars: [],
+      fixed: [],
     };
 
     const state = {
@@ -437,9 +442,11 @@
 
       sprites.city = geometry.cityLights;
       sprites.stars = geometry.backgroundStars;
+      sprites.fixed = geometry.fixedStars;
       cityLightCount = sprites.city.length;
       bgStarCount = sprites.stars.length;
-      spriteInstanceCount = cityLightCount + bgStarCount;
+      fixedStarCount = sprites.fixed.length;
+      spriteInstanceCount = cityLightCount + bgStarCount + fixedStarCount;
       spriteDataArray = new Float32Array(spriteInstanceCount * 8);
       spriteInstanceBuffer = device.createBuffer({
         size: spriteInstanceCount * 32,
@@ -464,6 +471,16 @@
         data[offset++] = sprite.intensity;
       }
       for (const sprite of sprites.stars) {
+        data[offset++] = sprite.position[0];
+        data[offset++] = sprite.position[1];
+        data[offset++] = sprite.position[2];
+        data[offset++] = sprite.size;
+        data[offset++] = sprite.color[0];
+        data[offset++] = sprite.color[1];
+        data[offset++] = sprite.color[2];
+        data[offset++] = sprite.intensity;
+      }
+      for (const sprite of sprites.fixed) {
         data[offset++] = sprite.position[0];
         data[offset++] = sprite.position[1];
         data[offset++] = sprite.position[2];
@@ -639,6 +656,7 @@
       const edgeVertices = [];
       const cityLights = [];
       const backgroundStars = [];
+      const fixedStars = [];
       const edgeSet = new Set();
       const faces = [];
 
@@ -695,14 +713,17 @@
       }
 
       for (let i = 0; i < config.bgStarCount; i++) {
-        const x = randRange(0, config.width);
-        const y = randRange(0, config.height);
-        const z = randRange(-config.maxDepth * 0.5, config.maxDepth * 0.5);
-        const world = [
-          (x - config.width * 0.5) / config.scale,
-          (config.height * 0.5 - y) / config.scale,
-          z / config.scale,
-        ];
+        // Cylindrical distribution rotated 90 deg (swapping Y and Z axis logic)
+        // Original: Y was height, X/Z were radius.
+        // New: Z is thickness (height), X/Y are radius (disk facing camera)
+        const theta = Math.random() * Math.PI * 2;
+        const r = Math.sqrt(Math.random()) * config.starCylinderRadius;
+        const x = Math.cos(theta) * r;
+        const y = Math.sin(theta) * r;
+        const z = randRange(-config.starCylinderHeight * 0.5, config.starCylinderHeight * 0.5);
+        
+        const world = [x, y, z];
+        
         const hue = Math.random();
         const rgb = hsvToRgb(hue, 1.0, 1.0);
         backgroundStars.push({
@@ -713,7 +734,26 @@
         });
       }
 
-      return { faces, cityLights, backgroundStars };
+      for (let i = 0; i < config.fixedStarCount; i++) {
+         // Fixed background stars (distant sphere or cylinder)
+        const theta = Math.random() * Math.PI * 2;
+        const r = config.starCylinderRadius * 1.5;
+        const x = Math.cos(theta) * r;
+        const y = Math.sin(theta) * r; // Swapped from Z
+        const z = randRange(-config.starCylinderHeight, config.starCylinderHeight); // Swapped from Y
+
+        const world = [x, y, z];
+        const hue = Math.random() * 0.1 + 0.6; // Blue-ish
+        const rgb = hsvToRgb(hue, 0.4, 0.8);
+        fixedStars.push({
+          position: world,
+          size: randRange(0.5, 1.5),
+          color: [rgb[0], rgb[1], rgb[2]],
+          intensity: 0.6,
+        });
+      }
+
+      return { faces, cityLights, backgroundStars, fixedStars };
     }
 
     function reverseEdgeFlags(edgeFlags) {
