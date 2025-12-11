@@ -3,7 +3,9 @@
 
 Render a stylized Dyson ring as a rotating wireframe with flickering starfield
 backdrop. The camera uses an orthographic projection so the ring keeps its
-scale while you yaw, pitch, and let it spin.
+scale while you yaw, pitch, and let it spin. The project now ships with both
+the original Python/Pygame renderer and a dependency-free WebGPU single-page
+version.
 
 ## Requirements
 
@@ -25,7 +27,7 @@ source .venv/bin/activate  # On Windows: .venv\\Scripts\\activate
 python -m pip install pygame numpy
 ```
 
-## Running
+## Running (Python build)
 
 From the repo root:
 
@@ -54,3 +56,27 @@ Euler angles for pitch, yaw, and spin.
 - The HUD uses `pygame.font.SysFont`. If the requested typeface is missing,
   Pygame falls back to an available system font automatically.
 - On macOS you may need to allow the SDL window to receive input if prompted.
+
+## WebGPU build (no dependencies)
+
+The WebGPU version lives in `index.html` and runs entirely client-side with no
+external libraries.
+
+1. Use a browser with WebGPU enabled (Chrome 113+, Edge 113+, Safari TP, or
+   Firefox Nightly with `dom.webgpu.enabled`).
+2. Serve the repo as a static site (WebGPU requires HTTPS/localhost):
+   ```bash
+   python -m http.server 8000
+   ```
+3. Visit `http://localhost:8000/index.html`.
+4. Drag with the mouse to yaw/pitch. Rotation speed and HUD readouts match the
+   Python build.
+
+Notes:
+
+- The background stars and city lights run as instanced quads with additive
+  blending, so performance scales well even on integrated GPUs.
+- If the canvas is blank, make sure the browser reports `navigator.gpu` and
+  that the page is served from `https://` or `http://localhost`.
+- The WebGPU renderer painter-sorts every panel each frame so translucent
+  faces stay in order. Close heavy tabs if you notice stutter.

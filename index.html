@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dyson Ring WebGPU</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Glass TTY VT220", "IBM Plex Mono", Menlo, Consolas, monospace;
+    }
+    body {
+      margin: 0;
+      background: #030303;
+      overflow: hidden;
+    }
+    #gpuCanvas {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+    }
+    #hud {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      color: #66f2ff;
+      font-size: 14px;
+      text-shadow: 0 0 8px rgba(0, 255, 255, 0.55);
+      line-height: 1.4;
+      pointer-events: none;
+    }
+    #status {
+      position: fixed;
+      bottom: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #ffe87d;
+      font-size: 13px;
+      text-align: center;
+      text-shadow: 0 0 8px rgba(255, 232, 125, 0.7);
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gpuCanvas"></canvas>
+  <div id="hud"></div>
+  <div id="status">Initializing WebGPU…</div>
+  <script type="module">
+    const config = {
+      width: 1200,
+      height: 900,
+      fps: 60,
+      background: [0, 0, 0, 1],
+      nSegments: 12,
+      arcSpan: degToRad(360),
+      arcStart: degToRad(-85),
+      rInner: 4.5,
+      rOuter: 7.5,
+      segHeight: 2.5,
+      subdivisions: 6,
+      bevelSize: 0.15,
+      lightsPerSegment: 200,
+      scale: 52.5,
+      tilt: degToRad(38),
+      initialYaw: degToRad(42),
+      baseAzim: degToRad(45),
+      rotSpeed: (35 * Math.PI) / 600.0,
+      starGlowRadius: 30,
+      bgStarCount: 600,
+      faceFillFront: [0 / 255, 255 / 255, 0 / 255, 80 / 255],
+      faceFillBack: [0 / 255, 200 / 255, 255 / 255, 45 / 255],
+      edgeColor: [0 / 255, 255 / 255, 0 / 255, 1],
+      maxDepth: 80,
+      doubleFaceOffset: 1e-4,
+    };
+
+    const canvas = document.getElementById("gpuCanvas");
+    const hud = document.getElementById("hud");
+    const statusEl = document.getElementById("status");
+    let device, context, presentationFormat;
+    let uniformBuffer, uniformBindGroup;
+    let facePipeline, edgePipeline, spritePipeline;
+    let faceVertexBuffer, edgeVertexBuffer, spriteVertexBuffer, spriteInstanceBuffer;
+    let faceVertexCount = 0;
+    let edgeVertexCount = 0;
+    let spriteInstanceCount = 0;
+    let spriteDataArray = null;
+    let cityLightCount = 0;
+    let bgStarCount = 0;
+    let faceRecords = [];
+    let faceSortOrder = [];
+    let faceVertexScratch = null;
+    let edgeVertexScratch = null;
+
+    const sprites = {
+      city: [],
+      stars: [],
+    };
+
+    const state = {
+      spin: 0,
+      yaw: config.initialYaw,
+      pitch: config.tilt,
+      dragging: false,
+      pointer: { x: 0, y: 0 },
+      lastFrame: performance.now(),
+    };
+
+    const rotationMatrix = new Float32Array(16);
+
+    const geometry = buildDysonGeometry();
+
+    setupPointerControls();
+    resizeCanvas();
+    window.addEventListener("resize", resizeCanvas);
+
+    if (!navigator.gpu) {
+      statusEl.textContent = "WebGPU is not available in this browser.";
+      throw new Error("WebGPU unsupported");
+    }
+
+    init().catch((err) => {
+      console.error(err);
+      statusEl.textContent = "Failed to initialize WebGPU: " + err.message;
+    });
+
+    async function init() {
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) throw new Error("No GPU adapter available");
+      device = await adapter.requestDevice();
+      context = canvas.getContext("webgpu");
+      presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+      configureContext();
+      createPipelines();
+      uploadStaticBuffers();
+      statusEl.textContent = "Drag to rotate • WebGPU active";
+      requestAnimationFrame(frame);
+    }
+
+    function configureContext() {
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.round(canvas.clientWidth * dpr);
+      const height = Math.round(canvas.clientHeight * dpr);
+      canvas.width = width;
+      canvas.height = height;
+      context.configure({
+        device,
+        format: presentationFormat,
+        alphaMode: "premultiplied",
+      });
+    }
+
+    function createPipelines() {
+      uniformBuffer = device.createBuffer({
+        size: 256,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+
+      const bindGroupLayout = device.createBindGroupLayout({
+        entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+            buffer: { type: "uniform" },
+          },
+        ],
+      });
+
+      uniformBindGroup = device.createBindGroup({
+        layout: bindGroupLayout,
+        entries: [
+          {
+            binding: 0,
+            resource: { buffer: uniformBuffer },
+          },
+        ],
+      });
+
+      const sharedLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+
+      const faceShaderModule = device.createShaderModule({
+        code: `
+          struct Uniforms {
+            rotation : mat4x4<f32>,
+            frontColor : vec4<f32>,
+            backColor : vec4<f32>,
+            edgeColor : vec4<f32>,
+            viewport : vec4<f32>, // width, height, depthRange, unused
+          };
+          @group(0) @binding(0) var<uniform> uniforms : Uniforms;
+
+          struct VertexOut {
+            @builtin(position) position : vec4<f32>,
+            @location(0) colorFront : vec4<f32>,
+            @location(1) colorBack : vec4<f32>,
+          };
+
+          fn project(pos : vec3<f32>) -> vec4<f32> {
+            let scaled = pos * ${config.scale};
+            let clipX = scaled.x / (0.5 * uniforms.viewport.x);
+            let clipY = -scaled.y / (0.5 * uniforms.viewport.y);
+            let clipZ = clamp((scaled.z + 0.5 * uniforms.viewport.z) / uniforms.viewport.z, 0.0, 1.0);
+            return vec4<f32>(clipX, clipY, clipZ, 1.0);
+          }
+
+          @vertex
+          fn vs_main(@location(0) position : vec3<f32>) -> VertexOut {
+            var out : VertexOut;
+            let rotated = (uniforms.rotation * vec4<f32>(position, 1.0)).xyz;
+            out.position = project(rotated);
+            out.colorFront = uniforms.frontColor;
+            out.colorBack = uniforms.backColor;
+            return out;
+          }
+
+          @fragment
+          fn fs_main(@location(0) colorFront : vec4<f32>, @location(1) colorBack : vec4<f32>, @builtin(front_facing) isFront : bool) -> @location(0) vec4<f32> {
+            return select(colorBack, colorFront, isFront);
+          }
+        `,
+      });
+
+      facePipeline = device.createRenderPipeline({
+        layout: sharedLayout,
+        vertex: {
+          module: faceShaderModule,
+          entryPoint: "vs_main",
+          buffers: [
+            {
+              arrayStride: 12,
+              attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }],
+            },
+          ],
+        },
+        fragment: {
+          module: faceShaderModule,
+          entryPoint: "fs_main",
+          targets: [
+            {
+              format: presentationFormat,
+              blend: {
+                color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
+                alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
+              },
+            },
+          ],
+        },
+        primitive: { topology: "triangle-list", cullMode: "none" },
+      });
+
+      const edgeShaderModule = device.createShaderModule({
+        code: `
+          struct Uniforms {
+            rotation : mat4x4<f32>,
+            frontColor : vec4<f32>,
+            backColor : vec4<f32>,
+            edgeColor : vec4<f32>,
+            viewport : vec4<f32>,
+          };
+          @group(0) @binding(0) var<uniform> uniforms : Uniforms;
+
+          fn project(pos : vec3<f32>) -> vec4<f32> {
+            let scaled = pos * ${config.scale};
+            let clipX = scaled.x / (0.5 * uniforms.viewport.x);
+            let clipY = -scaled.y / (0.5 * uniforms.viewport.y);
+            let clipZ = clamp((scaled.z + 0.5 * uniforms.viewport.z) / uniforms.viewport.z, 0.0, 1.0);
+            return vec4<f32>(clipX, clipY, clipZ, 1.0);
+          }
+
+          struct EdgeOut {
+            @builtin(position) position : vec4<f32>,
+          };
+
+          @vertex
+          fn vs_main(@location(0) position : vec3<f32>) -> EdgeOut {
+            var out : EdgeOut;
+            let rotated = (uniforms.rotation * vec4<f32>(position, 1.0)).xyz;
+            out.position = project(rotated);
+            return out;
+          }
+
+          @fragment
+          fn fs_main() -> @location(0) vec4<f32> {
+            return uniforms.edgeColor;
+          }
+        `,
+      });
+
+      edgePipeline = device.createRenderPipeline({
+        layout: sharedLayout,
+        vertex: {
+          module: edgeShaderModule,
+          entryPoint: "vs_main",
+          buffers: [
+            {
+              arrayStride: 12,
+              attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }],
+            },
+          ],
+        },
+        fragment: {
+          module: edgeShaderModule,
+          entryPoint: "fs_main",
+          targets: [
+            {
+              format: presentationFormat,
+            },
+          ],
+        },
+        primitive: { topology: "line-list", cullMode: "none" },
+      });
+
+      const spriteShaderModule = device.createShaderModule({
+        code: `
+          struct Uniforms {
+            rotation : mat4x4<f32>,
+            frontColor : vec4<f32>,
+            backColor : vec4<f32>,
+            edgeColor : vec4<f32>,
+            viewport : vec4<f32>,
+          };
+          @group(0) @binding(0) var<uniform> uniforms : Uniforms;
+
+          struct SpriteIn {
+            @location(0) corner : vec2<f32>,
+            @location(1) center : vec3<f32>,
+            @location(2) radius : f32,
+            @location(3) color : vec3<f32>,
+            @location(4) intensity : f32,
+          };
+
+          struct SpriteOut {
+            @builtin(position) position : vec4<f32>,
+            @location(0) color : vec4<f32>,
+          };
+
+          fn project(pos : vec3<f32>) -> vec4<f32> {
+            let scaled = pos * ${config.scale};
+            let clipX = scaled.x / (0.5 * uniforms.viewport.x);
+            let clipY = -scaled.y / (0.5 * uniforms.viewport.y);
+            let clipZ = clamp((scaled.z + 0.5 * uniforms.viewport.z) / uniforms.viewport.z, 0.0, 1.0);
+            return vec4<f32>(clipX, clipY, clipZ, 1.0);
+          }
+
+          @vertex
+          fn vs_main(input : SpriteIn) -> SpriteOut {
+            var out : SpriteOut;
+            let rotated = (uniforms.rotation * vec4<f32>(input.center, 1.0)).xyz;
+            var clip = project(rotated);
+            let px = input.radius * 2.0 / uniforms.viewport.x;
+            let py = input.radius * 2.0 / uniforms.viewport.y;
+            clip.x += input.corner.x * px;
+            clip.y += input.corner.y * py;
+            clip.z = 0.001;
+            out.position = clip;
+            out.color = vec4<f32>(input.color * input.intensity, 1.0);
+            return out;
+          }
+
+          @fragment
+          fn fs_main(@location(0) color : vec4<f32>) -> @location(0) vec4<f32> {
+            return color;
+          }
+        `,
+      });
+
+      spritePipeline = device.createRenderPipeline({
+        layout: sharedLayout,
+        vertex: {
+          module: spriteShaderModule,
+          entryPoint: "vs_main",
+          buffers: [
+            {
+              arrayStride: 8,
+              attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }],
+            },
+            {
+              arrayStride: 32,
+              stepMode: "instance",
+              attributes: [
+                { shaderLocation: 1, offset: 0, format: "float32x3" },
+                { shaderLocation: 2, offset: 12, format: "float32" },
+                { shaderLocation: 3, offset: 16, format: "float32x3" },
+                { shaderLocation: 4, offset: 28, format: "float32" },
+              ],
+            },
+          ],
+        },
+        fragment: {
+          module: spriteShaderModule,
+          entryPoint: "fs_main",
+          targets: [
+            {
+              format: presentationFormat,
+              blend: {
+                color: { srcFactor: "src-alpha", dstFactor: "one" },
+                alpha: { srcFactor: "zero", dstFactor: "one" },
+              },
+            },
+          ],
+        },
+        primitive: { topology: "triangle-list", cullMode: "none" },
+      });
+    }
+
+    function uploadStaticBuffers() {
+      faceRecords = geometry.faces;
+      faceVertexCount = faceRecords.length * 6;
+      faceVertexScratch = new Float32Array(faceVertexCount * 3);
+      edgeVertexScratch = new Float32Array(faceVertexCount * 8); // Safe upper bound: 4 edges * 2 verts * (worst case multiplier)
+      faceSortOrder = faceRecords.map((_, idx) => idx);
+      faceVertexBuffer = device.createBuffer({
+        size: faceVertexScratch.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      });
+
+      edgeVertexBuffer = device.createBuffer({
+        size: edgeVertexScratch.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      });
+
+      const quadVertices = new Float32Array([
+        -0.5, -0.5,
+         0.5, -0.5,
+        -0.5,  0.5,
+        -0.5,  0.5,
+         0.5, -0.5,
+         0.5,  0.5,
+      ]);
+      spriteVertexBuffer = device.createBuffer({
+        size: quadVertices.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true,
+      });
+      new Float32Array(spriteVertexBuffer.getMappedRange()).set(quadVertices);
+      spriteVertexBuffer.unmap();
+
+      sprites.city = geometry.cityLights;
+      sprites.stars = geometry.backgroundStars;
+      cityLightCount = sprites.city.length;
+      bgStarCount = sprites.stars.length;
+      spriteInstanceCount = cityLightCount + bgStarCount;
+      spriteDataArray = new Float32Array(spriteInstanceCount * 8);
+      spriteInstanceBuffer = device.createBuffer({
+        size: spriteInstanceCount * 32,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      });
+      updateSpriteBuffer();
+      composeRotationMatrix(state.yaw, state.pitch, config.baseAzim, rotationMatrix);
+      rebuildBuffers();
+    }
+
+    function updateSpriteBuffer() {
+      const data = spriteDataArray;
+      let offset = 0;
+      for (const sprite of sprites.city) {
+        data[offset++] = sprite.position[0];
+        data[offset++] = sprite.position[1];
+        data[offset++] = sprite.position[2];
+        data[offset++] = sprite.size;
+        data[offset++] = sprite.color[0];
+        data[offset++] = sprite.color[1];
+        data[offset++] = sprite.color[2];
+        data[offset++] = sprite.intensity;
+      }
+      for (const sprite of sprites.stars) {
+        data[offset++] = sprite.position[0];
+        data[offset++] = sprite.position[1];
+        data[offset++] = sprite.position[2];
+        data[offset++] = sprite.size;
+        data[offset++] = sprite.color[0];
+        data[offset++] = sprite.color[1];
+        data[offset++] = sprite.color[2];
+        data[offset++] = sprite.intensity;
+      }
+      device.queue.writeBuffer(spriteInstanceBuffer, 0, data.buffer);
+    }
+
+    function rebuildBuffers() {
+      if (!faceRecords.length) return;
+      for (let i = 0; i < faceSortOrder.length; i++) faceSortOrder[i] = i;
+      faceSortOrder.sort((a, b) => computeFaceDepth(a) - computeFaceDepth(b));
+      const triOrder = [0, 1, 2, 0, 2, 3];
+      let fCursor = 0;
+      let eCursor = 0;
+      
+      for (const faceIndex of faceSortOrder) {
+        const record = faceRecords[faceIndex];
+        const verts = record.verts;
+        // faces
+        for (let t = 0; t < triOrder.length; t++) {
+          const v = verts[triOrder[t]];
+          faceVertexScratch[fCursor++] = v[0];
+          faceVertexScratch[fCursor++] = v[1];
+          faceVertexScratch[fCursor++] = v[2];
+        }
+        // edges
+        const edgeFlags = record.edgeFlags;
+        const len = verts.length;
+        for (let k = 0; k < len; k++) {
+          if (edgeFlags[k]) {
+            const v1 = verts[k];
+            const v2 = verts[(k + 1) % len];
+            edgeVertexScratch[eCursor++] = v1[0];
+            edgeVertexScratch[eCursor++] = v1[1];
+            edgeVertexScratch[eCursor++] = v1[2];
+            edgeVertexScratch[eCursor++] = v2[0];
+            edgeVertexScratch[eCursor++] = v2[1];
+            edgeVertexScratch[eCursor++] = v2[2];
+          }
+        }
+      }
+      device.queue.writeBuffer(faceVertexBuffer, 0, faceVertexScratch);
+      device.queue.writeBuffer(edgeVertexBuffer, 0, edgeVertexScratch);
+      edgeVertexCount = eCursor / 3;
+    }
+
+    function computeFaceDepth(faceIndex) {
+      const record = faceRecords[faceIndex];
+      const verts = record.verts;
+      let sum = 0;
+      for (let i = 0; i < verts.length; i++) {
+        const v = verts[i];
+        sum += rotationMatrix[2] * v[0] + rotationMatrix[6] * v[1] + rotationMatrix[10] * v[2];
+      }
+      const avg = sum / verts.length;
+      return record.isBack ? avg - config.doubleFaceOffset : avg;
+    }
+
+    function frame(now) {
+      const dt = (now - state.lastFrame) / 1000;
+      state.lastFrame = now;
+      state.spin += config.rotSpeed * dt;
+
+      twinkleBackground();
+      updateSpriteBuffer();
+      updateUniformBuffer();
+      rebuildBuffers();
+      drawScene();
+      updateHud();
+      requestAnimationFrame(frame);
+    }
+
+    function twinkleBackground() {
+      for (const star of sprites.stars) {
+        if (Math.random() < 0.02) {
+          star.intensity = 0.4 + Math.random() * 0.6;
+        }
+      }
+    }
+
+    function updateUniformBuffer() {
+      const theta = state.spin + config.baseAzim;
+      composeRotationMatrix(state.yaw, state.pitch, theta, rotationMatrix);
+
+      const uniformArray = new Float32Array(32);
+      uniformArray.set(rotationMatrix);
+      uniformArray.set(config.faceFillFront, 16);
+      uniformArray.set(config.faceFillBack, 20);
+      uniformArray.set(config.edgeColor, 24);
+      const width = canvas.width;
+      const height = canvas.height;
+      uniformArray.set([width, height, config.maxDepth, 0], 28);
+      device.queue.writeBuffer(uniformBuffer, 0, uniformArray.buffer);
+    }
+
+    function drawScene() {
+      const commandEncoder = device.createCommandEncoder();
+      const textureView = context.getCurrentTexture().createView();
+      const renderPass = commandEncoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: textureView,
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
+      });
+
+      renderPass.setBindGroup(0, uniformBindGroup);
+
+      renderPass.setPipeline(facePipeline);
+      renderPass.setVertexBuffer(0, faceVertexBuffer);
+      renderPass.draw(faceVertexCount);
+
+      renderPass.setPipeline(edgePipeline);
+      renderPass.setVertexBuffer(0, edgeVertexBuffer);
+      renderPass.draw(edgeVertexCount);
+
+      renderPass.setPipeline(spritePipeline);
+      renderPass.setVertexBuffer(0, spriteVertexBuffer);
+      renderPass.setVertexBuffer(1, spriteInstanceBuffer);
+      renderPass.draw(6, spriteInstanceCount);
+
+      renderPass.end();
+      device.queue.submit([commandEncoder.finish()]);
+    }
+
+    function updateHud() {
+      hud.innerHTML = [
+        `Rot X (Pitch): ${(radToDeg(state.pitch)).toFixed(1)}°`,
+        `Rot Y (Yaw): ${(radToDeg(state.yaw)).toFixed(1)}°`,
+        `Rot Z (Spin): ${(radToDeg(state.spin + config.baseAzim)).toFixed(1)}°`,
+      ].join("<br />");
+    }
+
+    function resizeCanvas() {
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(window.innerWidth * dpr);
+      canvas.height = Math.round(window.innerHeight * dpr);
+      canvas.style.width = "100vw";
+      canvas.style.height = "100vh";
+      if (device) {
+        configureContext();
+      }
+    }
+
+    function setupPointerControls() {
+      window.addEventListener("pointerdown", (event) => {
+        state.dragging = true;
+        state.pointer.x = event.clientX;
+        state.pointer.y = event.clientY;
+      });
+      window.addEventListener("pointerup", () => (state.dragging = false));
+      window.addEventListener("pointerleave", () => (state.dragging = false));
+      window.addEventListener("pointermove", (event) => {
+        if (!state.dragging) return;
+        const dx = event.clientX - state.pointer.x;
+        const dy = event.clientY - state.pointer.y;
+        state.pointer.x = event.clientX;
+        state.pointer.y = event.clientY;
+        state.yaw += dx * 0.005;
+        state.pitch += dy * 0.005;
+      });
+    }
+
+    function buildDysonGeometry() {
+      const edgeVertices = [];
+      const cityLights = [];
+      const backgroundStars = [];
+      const edgeSet = new Set();
+      const faces = [];
+
+      const thetaStep = config.arcSpan / config.nSegments;
+      for (let i = 0; i < config.nSegments; i++) {
+        const angleCenter = config.arcStart + thetaStep * (i + 0.5);
+        const segment = makeCurvedBeveledSegment(
+          angleCenter,
+          config.arcSpan / config.nSegments * 0.9,
+          config.rInner,
+          config.rOuter,
+          config.segHeight,
+          config.subdivisions,
+          config.bevelSize,
+          i
+        );
+
+        for (const face of segment.faces) {
+          const indices = face.indices;
+          const verts = indices.map((idx) => segment.vertices[idx]);
+          const vertCopies = verts.map((v) => new Float32Array(v));
+          faces.push({
+            verts: vertCopies,
+            isBack: false,
+            edgeFlags: face.edgeFlags,
+            indices: indices,
+          });
+          faces.push({
+            verts: vertCopies.slice().reverse(),
+            isBack: true,
+            edgeFlags: reverseEdgeFlags(face.edgeFlags),
+            indices: indices.slice().reverse(),
+          });
+          for (let e = 0; e < indices.length; e++) {
+            if (!face.edgeFlags[e]) continue;
+            const aIdx = indices[e];
+            const bIdx = indices[(e + 1) % indices.length];
+            const key = aIdx < bIdx ? `${segment.id}:${aIdx}-${bIdx}` : `${segment.id}:${bIdx}-${aIdx}`;
+            if (edgeSet.has(key)) continue;
+            edgeSet.add(key);
+            edgeVertices.push(...segment.vertices[aIdx], ...segment.vertices[bIdx]);
+          }
+        }
+
+        if (segment.faces.length > 0 && config.lightsPerSegment > 0) {
+          for (let l = 0; l < config.lightsPerSegment; l++) {
+            const faceIdx = Math.floor(Math.random() * segment.faces.length);
+            const lightSample = samplePointOnQuad(segment.vertices, segment.faces[faceIdx].indices);
+            const size = Math.random() < 0.1 ? randRange(3.0, 8.0) : randRange(0.15, 2.5);
+            const color = [randRange(0.4, 0.8), randRange(0, 0.25), randRange(0, 0.25)];
+            cityLights.push({ position: lightSample, size, color, intensity: 1.0 });
+          }
+        }
+      }
+
+      for (let i = 0; i < config.bgStarCount; i++) {
+        const x = randRange(0, config.width);
+        const y = randRange(0, config.height);
+        const z = randRange(-config.maxDepth * 0.5, config.maxDepth * 0.5);
+        const world = [
+          (x - config.width * 0.5) / config.scale,
+          (config.height * 0.5 - y) / config.scale,
+          z / config.scale,
+        ];
+        const hue = Math.random();
+        const rgb = hsvToRgb(hue, 1.0, 1.0);
+        backgroundStars.push({
+          position: world,
+          size: randRange(0.5, 2.0),
+          color: [rgb[0], rgb[1], rgb[2]],
+          intensity: randRange(0.4, 1.0),
+        });
+      }
+
+      return { faces, cityLights, backgroundStars };
+    }
+
+    function reverseEdgeFlags(edgeFlags) {
+      if (edgeFlags.length <= 1) return edgeFlags.slice();
+      return edgeFlags.slice(0, -1).reverse().concat(edgeFlags.slice(-1));
+    }
+
+    function makeCurvedBeveledSegment(angleCenter, angleSpan, rInner, rOuter, height, subdivs, segmentId) {
+      const halfSpan = angleSpan * 0.5;
+      const thetaSteps = [];
+      for (let i = 0; i <= subdivs; i++) {
+        thetaSteps.push(angleCenter - halfSpan + (i * angleSpan) / subdivs);
+      }
+      const vertices = [];
+      const faces = [];
+      const pointsPerRing = 4;
+      for (let i = 0; i < thetaSteps.length; i++) {
+        const theta = thetaSteps[i];
+        const c = Math.cos(theta);
+        const s = Math.sin(theta);
+        const rs = [rInner, rOuter, rOuter, rInner];
+        const zs = [-height / 2, -height / 2, height / 2, height / 2];
+        for (let j = 0; j < pointsPerRing; j++) {
+          vertices.push([rs[j] * c, rs[j] * s, zs[j]]);
+        }
+        if (i === 0) continue;
+        const base = i * pointsPerRing;
+        const prev = (i - 1) * pointsPerRing;
+        for (let j = 0; j < pointsPerRing; j++) {
+          const next = (j + 1) % pointsPerRing;
+          const faceIndices = [prev + j, base + j, base + next, prev + next];
+          const drawFlags = [true, i === thetaSteps.length - 1, true, i === 1];
+          faces.push({ indices: faceIndices, edgeFlags: drawFlags });
+        }
+      }
+      faces.push({ indices: [0, 1, 2, 3], edgeFlags: [true, true, true, true] });
+      const lastBase = (thetaSteps.length - 1) * pointsPerRing;
+      faces.push({ indices: [lastBase + 3, lastBase + 2, lastBase + 1, lastBase], edgeFlags: [true, true, true, true] });
+      return { vertices, faces, id: segmentId };
+    }
+
+    function samplePointOnQuad(vertices, indices) {
+      if (indices.length !== 4) return vertices[indices[0]];
+      const [aIdx, bIdx, cIdx, dIdx] = indices;
+      const a = vertices[aIdx];
+      const b = vertices[bIdx];
+      const c = vertices[cIdx];
+      const d = vertices[dIdx];
+      const u = Math.random();
+      const v = Math.random();
+      return [
+        (1 - u) * (1 - v) * a[0] + u * (1 - v) * b[0] + u * v * c[0] + (1 - u) * v * d[0],
+        (1 - u) * (1 - v) * a[1] + u * (1 - v) * b[1] + u * v * c[1] + (1 - u) * v * d[1],
+        (1 - u) * (1 - v) * a[2] + u * (1 - v) * b[2] + u * v * c[2] + (1 - u) * v * d[2],
+      ];
+    }
+
+    function composeRotationMatrix(yaw, pitch, roll, out) {
+      const cy = Math.cos(yaw);
+      const sy = Math.sin(yaw);
+      const cx = Math.cos(pitch);
+      const sx = Math.sin(pitch);
+      const cz = Math.cos(roll);
+      const sz = Math.sin(roll);
+
+      const m00 = cy * cz + sy * sx * sz;
+      const m01 = -cy * sz + sy * sx * cz;
+      const m02 = sy * cx;
+      const m10 = cx * sz;
+      const m11 = cx * cz;
+      const m12 = -sx;
+      const m20 = -sy * cz + cy * sx * sz;
+      const m21 = sy * sz + cy * sx * cz;
+      const m22 = cy * cx;
+
+      out[0] = m00;
+      out[1] = m10;
+      out[2] = m20;
+      out[3] = 0;
+      out[4] = m01;
+      out[5] = m11;
+      out[6] = m21;
+      out[7] = 0;
+      out[8] = m02;
+      out[9] = m12;
+      out[10] = m22;
+      out[11] = 0;
+      out[12] = 0;
+      out[13] = 0;
+      out[14] = 0;
+      out[15] = 1;
+    }
+
+    function hsvToRgb(h, s, v) {
+      const i = Math.floor(h * 6);
+      const f = h * 6 - i;
+      const p = v * (1 - s);
+      const q = v * (1 - f * s);
+      const t = v * (1 - (1 - f) * s);
+      const mod = i % 6;
+      const rgb = [v, t, p, v, p, q, t, v, p, p, v, t, p, q, v, q, p, v];
+      return [rgb[mod * 3], rgb[mod * 3 + 1], rgb[mod * 3 + 2]];
+    }
+
+    function randRange(min, max) {
+      return min + Math.random() * (max - min);
+    }
+
+    function degToRad(deg) {
+      return (deg * Math.PI) / 180;
+    }
+
+    function radToDeg(rad) {
+      return (rad * 180) / Math.PI;
+    }
+  </script>
+</body>
+</html>
