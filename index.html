@@ -69,7 +69,7 @@
       bgStarCount: 60000,
       fixedStarCount: 2000,
       starCylinderRadius: 40, // much wider than ring (7.5)
-      starCylinderHeight: 2, // tall volume
+      starCylinderHeight: 8, // tall volume
       faceFillFront: [0 / 255, 255 / 255, 0 / 255, 80 / 255],
       faceFillBack: [0 / 255, 200 / 255, 255 / 255, 45 / 255],
       edgeColor: [0 / 255, 255 / 255, 0 / 255, 1],
@@ -650,6 +650,11 @@
         state.yaw += dx * 0.005;
         state.pitch += dy * 0.005;
       });
+      window.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        const sensitivity = 0.0005;
+        config.rotSpeed += event.deltaY * sensitivity;
+      }, { passive: false });
     }
 
     function buildDysonGeometry() {
