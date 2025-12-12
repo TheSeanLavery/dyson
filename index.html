@@ -15,9 +15,12 @@
       overflow: hidden;
     }
     #gpuCanvas {
+      position: fixed;
+      inset: 0;
       width: 100vw;
       height: 100vh;
       display: block;
+      z-index: 1;
     }
     #hud {
       position: fixed;
@@ -28,6 +31,7 @@
       text-shadow: 0 0 8px rgba(0, 255, 255, 0.55);
       line-height: 1.4;
       pointer-events: none;
+      z-index: 2;
     }
     #status {
       position: fixed;
@@ -38,6 +42,7 @@
       font-size: 13px;
       text-align: center;
       text-shadow: 0 0 8px rgba(255, 232, 125, 0.7);
+      z-index: 2;
     }
   </style>
 </head>
@@ -66,6 +71,7 @@
       baseAzim: degToRad(45),
       rotSpeed: (35 * Math.PI) / 600.0,
       starGlowRadius: 30,
+      // Rotating (world-space) star volume. Toggled with "S".
       bgStarCount: 6000,
       fixedStarCount: 400,
       starCylinderRadius: 40, // much wider than ring (7.5)
@@ -86,11 +92,12 @@
     const statusEl = document.getElementById("status");
     let device, context, presentationFormat;
     let uniformBuffer, uniformBindGroup;
-    let facePipeline, thickLinePipeline, spritePipeline;
+    let facePipeline, thickLinePipeline, spriteBgPipeline, spriteFgPipeline;
     let faceVertexBuffer, lineVertexBuffer, lineInstanceBuffer, spriteVertexBuffer, spriteInstanceBuffer;
     let faceVertexCount = 0;
     let lineInstanceCount = 0;
     let spriteInstanceCount = 0;
+    let spriteCapacityCount = 0;
     let spriteDataArray = null;
     let cityLightCount = 0;
     let bgStarCount = 0;
@@ -99,6 +106,7 @@
     let faceSortOrder = [];
     let faceVertexScratch = null;
     let edgeVertexScratch = null;
+    let allRotatingStars = [];
 
     const sprites = {
       city: [],
@@ -111,6 +119,7 @@
       yaw: config.initialYaw,
       pitch: config.tilt,
       dragging: false,
+      showRotatingStars: false,
       pointer: { x: 0, y: 0 },
       lastFrame: performance.now(),
     };
@@ -120,6 +129,7 @@
     const geometry = buildDysonGeometry();
 
     setupPointerControls();
+    setupKeyboardControls();
     resizeCanvas();
     window.addEventListener("resize", resizeCanvas);
 
@@ -142,7 +152,7 @@
       configureContext();
       createPipelines();
       uploadStaticBuffers();
-      statusEl.textContent = "Drag to rotate • WebGPU active";
+      statusEl.textContent = "Drag to rotate • Rotating stars: OFF (S to toggle)";
       requestAnimationFrame(frame);
     }
 
@@ -355,7 +365,7 @@
         primitive: { topology: "triangle-list", cullMode: "none" },
       });
 
-      const spriteShaderModule = device.createShaderModule({
+      const spriteBgShaderModule = device.createShaderModule({
         code: `
           struct Uniforms {
             rotation : mat4x4<f32>,
@@ -391,14 +401,21 @@
           @vertex
           fn vs_main(input : SpriteIn) -> SpriteOut {
             var out : SpriteOut;
-            let rotated = (uniforms.rotation * vec4<f32>(input.center, 1.0)).xyz;
-            var clip = project(rotated);
-            let px = input.radius * 2.0 / uniforms.viewport.x;
-            let py = input.radius * 2.0 / uniforms.viewport.y;
+            // If radius is negative, treat center.xy as NDC and keep it fixed to the screen.
+            // Otherwise, treat center as world-space and rotate/project it like other geometry.
+            let rPx = abs(input.radius);
+            var clip : vec4<f32>;
+            if (input.radius < 0.0) {
+              clip = vec4<f32>(input.center.xy, 0.999, 1.0);
+            } else {
+              let rotated = (uniforms.rotation * vec4<f32>(input.center, 1.0)).xyz;
+              clip = project(rotated);
+              // Keep projected depth; draw order determines background/foreground.
+            }
+            let px = rPx * 2.0 / uniforms.viewport.x;
+            let py = rPx * 2.0 / uniforms.viewport.y;
             clip.x += input.corner.x * px;
             clip.y += input.corner.y * py;
-            // Always render sprites in front
-            clip.z = 0.0;
             out.position = clip;
             // Pass local quad coords for circular mask in fragment
             out.local = input.corner;
@@ -418,10 +435,81 @@
         `,
       });
 
-      spritePipeline = device.createRenderPipeline({
+      const spriteFgShaderModule = device.createShaderModule({
+        code: `
+          struct Uniforms {
+            rotation : mat4x4<f32>,
+            frontColor : vec4<f32>,
+            backColor : vec4<f32>,
+            edgeColor : vec4<f32>,
+            viewport : vec4<f32>,
+          };
+          @group(0) @binding(0) var<uniform> uniforms : Uniforms;
+
+          struct SpriteIn {
+            @location(0) corner : vec2<f32>,
+            @location(1) center : vec3<f32>,
+            @location(2) radius : f32,
+            @location(3) color : vec3<f32>,
+            @location(4) intensity : f32,
+          };
+
+          struct SpriteOut {
+            @builtin(position) position : vec4<f32>,
+            @location(0) color : vec4<f32>,
+            @location(1) local : vec2<f32>,
+          };
+
+          fn project(pos : vec3<f32>) -> vec4<f32> {
+            let scaled = pos * ${config.scale};
+            let clipX = scaled.x / (0.5 * uniforms.viewport.x);
+            let clipY = -scaled.y / (0.5 * uniforms.viewport.y);
+            let clipZ = clamp((scaled.z + 0.5 * uniforms.viewport.z) / uniforms.viewport.z, 0.0, 1.0);
+            return vec4<f32>(clipX, clipY, clipZ, 1.0);
+          }
+
+          @vertex
+          fn vs_main(input : SpriteIn) -> SpriteOut {
+            var out : SpriteOut;
+            // If radius is negative, treat center.xy as NDC and keep it fixed to the screen.
+            // Otherwise, treat center as world-space and rotate/project it like other geometry.
+            let rPx = abs(input.radius);
+            var clip : vec4<f32>;
+            if (input.radius < 0.0) {
+              clip = vec4<f32>(input.center.xy, 0.999, 1.0);
+            } else {
+              let rotated = (uniforms.rotation * vec4<f32>(input.center, 1.0)).xyz;
+              clip = project(rotated);
+              // Foreground: force world-space sprites (city lights) to the front.
+              clip.z = 0.0;
+            }
+            let px = rPx * 2.0 / uniforms.viewport.x;
+            let py = rPx * 2.0 / uniforms.viewport.y;
+            clip.x += input.corner.x * px;
+            clip.y += input.corner.y * py;
+            out.position = clip;
+            // Pass local quad coords for circular mask in fragment
+            out.local = input.corner;
+            out.color = vec4<f32>(input.color * input.intensity, 1.0);
+            return out;
+          }
+
+          @fragment
+          fn fs_main(@location(0) color : vec4<f32>, @location(1) local : vec2<f32>) -> @location(0) vec4<f32> {
+            // local is in [-0.5, 0.5]; make a smooth circular dot
+            let r = length(local) * 2.0; // 0 at center, 1 at edge of circle
+            let aa = 0.06;               // edge softness
+            let alpha = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);
+            // Premultiply so blending looks correct
+            return vec4<f32>(color.rgb * alpha, alpha);
+          }
+        `,
+      });
+
+      spriteBgPipeline = device.createRenderPipeline({
         layout: sharedLayout,
         vertex: {
-          module: spriteShaderModule,
+          module: spriteBgShaderModule,
           entryPoint: "vs_main",
           buffers: [
             {
@@ -441,7 +529,46 @@
           ],
         },
         fragment: {
-          module: spriteShaderModule,
+          module: spriteBgShaderModule,
+          entryPoint: "fs_main",
+          targets: [
+            {
+              format: presentationFormat,
+              blend: {
+                // Sprite shader outputs premultiplied alpha.
+                color: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
+                alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
+              },
+            },
+          ],
+        },
+        primitive: { topology: "triangle-list", cullMode: "none" },
+      });
+
+      spriteFgPipeline = device.createRenderPipeline({
+        layout: sharedLayout,
+        vertex: {
+          module: spriteFgShaderModule,
+          entryPoint: "vs_main",
+          buffers: [
+            {
+              arrayStride: 8,
+              attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }],
+            },
+            {
+              arrayStride: 32,
+              stepMode: "instance",
+              attributes: [
+                { shaderLocation: 1, offset: 0, format: "float32x3" },
+                { shaderLocation: 2, offset: 12, format: "float32" },
+                { shaderLocation: 3, offset: 16, format: "float32x3" },
+                { shaderLocation: 4, offset: 28, format: "float32" },
+              ],
+            },
+          ],
+        },
+        fragment: {
+          module: spriteFgShaderModule,
           entryPoint: "fs_main",
           targets: [
             {
@@ -509,16 +636,22 @@
       new Float32Array(spriteVertexBuffer.getMappedRange()).set(quadVertices);
       spriteVertexBuffer.unmap();
 
+      // Fixed stars are screen-space sprites (size < 0) so they never move.
+      sprites.fixed = buildFixedStarSprites();
+      allRotatingStars = geometry.backgroundStars;
       sprites.city = geometry.cityLights;
-      sprites.stars = geometry.backgroundStars;
-      sprites.fixed = geometry.fixedStars;
-      cityLightCount = sprites.city.length;
-      bgStarCount = sprites.stars.length;
+      sprites.stars = state.showRotatingStars ? allRotatingStars : [];
+
       fixedStarCount = sprites.fixed.length;
-      spriteInstanceCount = cityLightCount + bgStarCount + fixedStarCount;
-      spriteDataArray = new Float32Array(spriteInstanceCount * 8);
+      bgStarCount = sprites.stars.length;
+      cityLightCount = sprites.city.length;
+
+      // Allocate for maximum possible instances so we can toggle without reallocating GPU buffers.
+      spriteCapacityCount = fixedStarCount + allRotatingStars.length + cityLightCount;
+      spriteInstanceCount = fixedStarCount + bgStarCount + cityLightCount;
+      spriteDataArray = new Float32Array(spriteCapacityCount * 8);
       spriteInstanceBuffer = device.createBuffer({
-        size: spriteInstanceCount * 32,
+        size: spriteCapacityCount * 32,
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       });
       updateSpriteBuffer();
@@ -529,7 +662,12 @@
     function updateSpriteBuffer() {
       const data = spriteDataArray;
       let offset = 0;
-      for (const sprite of sprites.city) {
+      fixedStarCount = sprites.fixed.length;
+      bgStarCount = sprites.stars.length;
+      cityLightCount = sprites.city.length;
+      spriteInstanceCount = fixedStarCount + bgStarCount + cityLightCount;
+
+      for (const sprite of sprites.fixed) {
         data[offset++] = sprite.position[0];
         data[offset++] = sprite.position[1];
         data[offset++] = sprite.position[2];
@@ -549,7 +687,7 @@
         data[offset++] = sprite.color[2];
         data[offset++] = sprite.intensity;
       }
-      for (const sprite of sprites.fixed) {
+      for (const sprite of sprites.city) {
         data[offset++] = sprite.position[0];
         data[offset++] = sprite.position[1];
         data[offset++] = sprite.position[2];
@@ -559,7 +697,8 @@
         data[offset++] = sprite.color[2];
         data[offset++] = sprite.intensity;
       }
-      device.queue.writeBuffer(spriteInstanceBuffer, 0, data.buffer);
+      // Write only the active portion.
+      device.queue.writeBuffer(spriteInstanceBuffer, 0, data.buffer, 0, spriteInstanceCount * 32);
     }
 
     function rebuildBuffers() {
@@ -648,7 +787,7 @@
     function drawScene() {
       const commandEncoder = device.createCommandEncoder();
       const textureView = context.getCurrentTexture().createView();
-      const ringPass = commandEncoder.beginRenderPass({
+      const pass = commandEncoder.beginRenderPass({
         colorAttachments: [
           {
             view: textureView,
@@ -659,36 +798,42 @@
         ],
       });
 
-      ringPass.setBindGroup(0, uniformBindGroup);
+      pass.setBindGroup(0, uniformBindGroup);
 
-      ringPass.setPipeline(facePipeline);
-      ringPass.setVertexBuffer(0, faceVertexBuffer);
-      ringPass.draw(faceVertexCount);
+      // Background: fixed stars first (screen-space instances; they never move).
+      if (fixedStarCount > 0) {
+        pass.setPipeline(spriteBgPipeline);
+        pass.setVertexBuffer(0, spriteVertexBuffer);
+        pass.setVertexBuffer(1, spriteInstanceBuffer);
+        pass.draw(6, fixedStarCount, 0, 0);
+      }
 
-      ringPass.setPipeline(thickLinePipeline);
-      ringPass.setVertexBuffer(0, lineVertexBuffer);
-      ringPass.setVertexBuffer(1, lineInstanceBuffer);
-      ringPass.draw(6, lineInstanceCount);
+      // Background: rotating (world-space) stars.
+      if (bgStarCount > 0) {
+        pass.setPipeline(spriteBgPipeline);
+        pass.setVertexBuffer(0, spriteVertexBuffer);
+        pass.setVertexBuffer(1, spriteInstanceBuffer);
+        pass.draw(6, bgStarCount, 0, fixedStarCount);
+      }
 
-      ringPass.end();
+      pass.setPipeline(facePipeline);
+      pass.setVertexBuffer(0, faceVertexBuffer);
+      pass.draw(faceVertexCount);
 
-      const spritePass = commandEncoder.beginRenderPass({
-        colorAttachments: [
-          {
-            view: textureView,
-            loadOp: "load",
-            storeOp: "store",
-          },
-        ],
-      });
+      pass.setPipeline(thickLinePipeline);
+      pass.setVertexBuffer(0, lineVertexBuffer);
+      pass.setVertexBuffer(1, lineInstanceBuffer);
+      pass.draw(6, lineInstanceCount);
 
-      spritePass.setBindGroup(0, uniformBindGroup);
-      spritePass.setPipeline(spritePipeline);
-      spritePass.setVertexBuffer(0, spriteVertexBuffer);
-      spritePass.setVertexBuffer(1, spriteInstanceBuffer);
-      spritePass.draw(6, spriteInstanceCount);
+      // Foreground: city lights (world-space instances).
+      if (cityLightCount > 0) {
+        pass.setPipeline(spriteFgPipeline);
+        pass.setVertexBuffer(0, spriteVertexBuffer);
+        pass.setVertexBuffer(1, spriteInstanceBuffer);
+        pass.draw(6, cityLightCount, 0, fixedStarCount + bgStarCount);
+      }
 
-      spritePass.end();
+      pass.end();
       device.queue.submit([commandEncoder.finish()]);
     }
 
@@ -697,6 +842,7 @@
         `Rot X (Pitch): ${(radToDeg(state.pitch)).toFixed(1)}°`,
         `Rot Y (Yaw): ${(radToDeg(state.yaw)).toFixed(1)}°`,
         `Rot Z (Spin): ${(radToDeg(state.spin + config.baseAzim)).toFixed(1)}°`,
+        `Rotating stars: ${state.showRotatingStars ? "ON" : "OFF"} (S)`,
       ].join("<br />");
     }
 
@@ -709,6 +855,42 @@
       if (device) {
         configureContext();
       }
+    }
+
+    function buildFixedStarSprites() {
+      const fixed = [];
+      for (let i = 0; i < config.fixedStarCount; i++) {
+        const x = randRange(-1.0, 1.0);
+        const y = randRange(-1.0, 1.0);
+        const z = 0.0;
+        const hue = Math.random() * 0.1 + 0.6; // Blue-ish
+        const rgb = hsvToRgb(hue, 0.35, 1.0);
+        fixed.push({
+          // center.xy is NDC; size < 0 flags "screen-space" in the sprite vertex shader.
+          position: [x, y, z],
+          size: -randRange(0.8, 2.0) * config.starSizeMul,
+          color: [rgb[0], rgb[1], rgb[2]],
+          intensity: randRange(0.35, 0.9),
+        });
+      }
+      return fixed;
+    }
+
+    function setupKeyboardControls() {
+      window.addEventListener("keydown", (event) => {
+        if (event.repeat) return;
+        if (event.code !== "KeyS") return;
+
+        state.showRotatingStars = !state.showRotatingStars;
+        statusEl.textContent = state.showRotatingStars
+          ? "Drag to rotate • Rotating stars: ON (S to toggle)"
+          : "Drag to rotate • Rotating stars: OFF (S to toggle)";
+
+        // If WebGPU isn't initialized yet, `uploadStaticBuffers()` will pick up the state later.
+        if (!device || !spriteInstanceBuffer || !spriteDataArray) return;
+        sprites.stars = state.showRotatingStars ? allRotatingStars : [];
+        updateSpriteBuffer();
+      });
     }
 
     function setupPointerControls() {
