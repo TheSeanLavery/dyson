@@ -59,20 +59,24 @@
       segHeight: 2.5,
       subdivisions: 6,
       bevelSize: 0.15,
-      lightsPerSegment: 200,
+      lightsPerSegment: 40,
       scale: 52.5,
       tilt: degToRad(38),
       initialYaw: degToRad(42),
       baseAzim: degToRad(45),
       rotSpeed: (35 * Math.PI) / 600.0,
       starGlowRadius: 30,
-      bgStarCount: 60000,
-      fixedStarCount: 2000,
+      bgStarCount: 6000,
+      fixedStarCount: 400,
       starCylinderRadius: 40, // much wider than ring (7.5)
       starCylinderHeight: 8, // tall volume
-      faceFillFront: [0 / 255, 255 / 255, 0 / 255, 80 / 255],
-      faceFillBack: [0 / 255, 200 / 255, 255 / 255, 45 / 255],
+      // Make panels more transparent and edges visually stronger
+      faceFillFront: [0 / 255, 255 / 255, 0 / 255, 40 / 255],
+      faceFillBack: [0 / 255, 200 / 255, 255 / 255, 25 / 255],
       edgeColor: [0 / 255, 255 / 255, 0 / 255, 1],
+      edgeWidthPx: 5.0,
+      starSizeMul: 3.0,
+      cityLightSizeMul: 1.5,
       maxDepth: 80,
       doubleFaceOffset: 1e-4,
     };
@@ -82,10 +86,10 @@
     const statusEl = document.getElementById("status");
     let device, context, presentationFormat;
     let uniformBuffer, uniformBindGroup;
-    let facePipeline, edgePipeline, spritePipeline;
-    let faceVertexBuffer, edgeVertexBuffer, spriteVertexBuffer, spriteInstanceBuffer;
+    let facePipeline, thickLinePipeline, spritePipeline;
+    let faceVertexBuffer, lineVertexBuffer, lineInstanceBuffer, spriteVertexBuffer, spriteInstanceBuffer;
     let faceVertexCount = 0;
-    let edgeVertexCount = 0;
+    let lineInstanceCount = 0;
     let spriteInstanceCount = 0;
     let spriteDataArray = null;
     let cityLightCount = 0;
@@ -253,7 +257,7 @@
         primitive: { topology: "triangle-list", cullMode: "none" },
       });
 
-      const edgeShaderModule = device.createShaderModule({
+      const thickLineShaderModule = device.createShaderModule({
         code: `
           struct Uniforms {
             rotation : mat4x4<f32>,
@@ -272,15 +276,43 @@
             return vec4<f32>(clipX, clipY, clipZ, 1.0);
           }
 
-          struct EdgeOut {
+          struct LineOut {
             @builtin(position) position : vec4<f32>,
           };
 
+          struct LineIn {
+            // corner.x = t along the line [0..1], corner.y = side [-1..1]
+            @location(0) corner : vec2<f32>,
+            @location(1) p0 : vec3<f32>,
+            @location(2) p1 : vec3<f32>,
+          };
+
           @vertex
-          fn vs_main(@location(0) position : vec3<f32>) -> EdgeOut {
-            var out : EdgeOut;
-            let rotated = (uniforms.rotation * vec4<f32>(position, 1.0)).xyz;
-            out.position = project(rotated);
+          fn vs_main(input : LineIn) -> LineOut {
+            var out : LineOut;
+
+            let r0 = (uniforms.rotation * vec4<f32>(input.p0, 1.0)).xyz;
+            let r1 = (uniforms.rotation * vec4<f32>(input.p1, 1.0)).xyz;
+            let c0 = project(r0);
+            let c1 = project(r1);
+
+            let ndc0 = c0.xy;
+            let ndc1 = c1.xy;
+            let dir = ndc1 - ndc0;
+            let dirLen = max(length(dir), 1e-6);
+            let dirN = dir / dirLen;
+            let perp = vec2<f32>(-dirN.y, dirN.x);
+
+            // Convert desired pixel width into NDC units
+            // viewport.w is reserved for edgeWidthPx
+            let halfW = 0.5 * uniforms.viewport.w;
+            let pxToNdc = vec2<f32>(2.0 / uniforms.viewport.x, 2.0 / uniforms.viewport.y);
+            let offset = perp * (halfW * pxToNdc) * input.corner.y;
+
+            let pos2 = mix(ndc0, ndc1, input.corner.x) + offset;
+            // Put lines slightly in front in depth
+            let z = max(0.0, min(c0.z, c1.z) - 1e-4);
+            out.position = vec4<f32>(pos2, z, 1.0);
             return out;
           }
 
@@ -291,20 +323,28 @@
         `,
       });
 
-      edgePipeline = device.createRenderPipeline({
+      thickLinePipeline = device.createRenderPipeline({
         layout: sharedLayout,
         vertex: {
-          module: edgeShaderModule,
+          module: thickLineShaderModule,
           entryPoint: "vs_main",
           buffers: [
             {
-              arrayStride: 12,
-              attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }],
+              arrayStride: 8,
+              attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }],
+            },
+            {
+              arrayStride: 24,
+              stepMode: "instance",
+              attributes: [
+                { shaderLocation: 1, offset: 0, format: "float32x3" },
+                { shaderLocation: 2, offset: 12, format: "float32x3" },
+              ],
             },
           ],
         },
         fragment: {
-          module: edgeShaderModule,
+          module: thickLineShaderModule,
           entryPoint: "fs_main",
           targets: [
             {
@@ -312,7 +352,7 @@
             },
           ],
         },
-        primitive: { topology: "line-list", cullMode: "none" },
+        primitive: { topology: "triangle-list", cullMode: "none" },
       });
 
       const spriteShaderModule = device.createShaderModule({
@@ -337,6 +377,7 @@
           struct SpriteOut {
             @builtin(position) position : vec4<f32>,
             @location(0) color : vec4<f32>,
+            @location(1) local : vec2<f32>,
           };
 
           fn project(pos : vec3<f32>) -> vec4<f32> {
@@ -356,15 +397,23 @@
             let py = input.radius * 2.0 / uniforms.viewport.y;
             clip.x += input.corner.x * px;
             clip.y += input.corner.y * py;
-            clip.z = 0.001;
+            // Always render sprites in front
+            clip.z = 0.0;
             out.position = clip;
+            // Pass local quad coords for circular mask in fragment
+            out.local = input.corner;
             out.color = vec4<f32>(input.color * input.intensity, 1.0);
             return out;
           }
 
           @fragment
-          fn fs_main(@location(0) color : vec4<f32>) -> @location(0) vec4<f32> {
-            return color;
+          fn fs_main(@location(0) color : vec4<f32>, @location(1) local : vec2<f32>) -> @location(0) vec4<f32> {
+            // local is in [-0.5, 0.5]; make a smooth circular dot
+            let r = length(local) * 2.0; // 0 at center, 1 at edge of circle
+            let aa = 0.06;               // edge softness
+            let alpha = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);
+            // Premultiply so blending looks correct
+            return vec4<f32>(color.rgb * alpha, alpha);
           }
         `,
       });
@@ -398,8 +447,9 @@
             {
               format: presentationFormat,
               blend: {
-                color: { srcFactor: "src-alpha", dstFactor: "one" },
-                alpha: { srcFactor: "zero", dstFactor: "one" },
+                // Sprite shader outputs premultiplied alpha.
+                color: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
+                alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
               },
             },
           ],
@@ -412,17 +462,36 @@
       faceRecords = geometry.faces;
       faceVertexCount = faceRecords.length * 6;
       faceVertexScratch = new Float32Array(faceVertexCount * 3);
-      edgeVertexScratch = new Float32Array(faceVertexCount * 8); // Safe upper bound: 4 edges * 2 verts * (worst case multiplier)
+      // Thick line instances: max 4 edges per quad face.
+      const maxLineInstances = faceRecords.length * 4;
+      edgeVertexScratch = new Float32Array(maxLineInstances * 6); // p0(3) + p1(3)
       faceSortOrder = faceRecords.map((_, idx) => idx);
       faceVertexBuffer = device.createBuffer({
         size: faceVertexScratch.byteLength,
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       });
 
-      edgeVertexBuffer = device.createBuffer({
+      lineInstanceBuffer = device.createBuffer({
         size: edgeVertexScratch.byteLength,
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       });
+
+      const lineQuadCorners = new Float32Array([
+        // t, side
+        0.0, -1.0,
+        0.0,  1.0,
+        1.0, -1.0,
+        1.0, -1.0,
+        0.0,  1.0,
+        1.0,  1.0,
+      ]);
+      lineVertexBuffer = device.createBuffer({
+        size: lineQuadCorners.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true,
+      });
+      new Float32Array(lineVertexBuffer.getMappedRange()).set(lineQuadCorners);
+      lineVertexBuffer.unmap();
 
       const quadVertices = new Float32Array([
         -0.5, -0.5,
@@ -499,7 +568,7 @@
       faceSortOrder.sort((a, b) => computeFaceDepth(a) - computeFaceDepth(b));
       const triOrder = [0, 1, 2, 0, 2, 3];
       let fCursor = 0;
-      let eCursor = 0;
+      let instCursor = 0;
       
       for (const faceIndex of faceSortOrder) {
         const record = faceRecords[faceIndex];
@@ -511,25 +580,27 @@
           faceVertexScratch[fCursor++] = v[1];
           faceVertexScratch[fCursor++] = v[2];
         }
-        // edges
+        // edges -> thick line instances
         const edgeFlags = record.edgeFlags;
         const len = verts.length;
         for (let k = 0; k < len; k++) {
           if (edgeFlags[k]) {
             const v1 = verts[k];
             const v2 = verts[(k + 1) % len];
-            edgeVertexScratch[eCursor++] = v1[0];
-            edgeVertexScratch[eCursor++] = v1[1];
-            edgeVertexScratch[eCursor++] = v1[2];
-            edgeVertexScratch[eCursor++] = v2[0];
-            edgeVertexScratch[eCursor++] = v2[1];
-            edgeVertexScratch[eCursor++] = v2[2];
+            // p0
+            edgeVertexScratch[instCursor++] = v1[0];
+            edgeVertexScratch[instCursor++] = v1[1];
+            edgeVertexScratch[instCursor++] = v1[2];
+            // p1
+            edgeVertexScratch[instCursor++] = v2[0];
+            edgeVertexScratch[instCursor++] = v2[1];
+            edgeVertexScratch[instCursor++] = v2[2];
           }
         }
       }
       device.queue.writeBuffer(faceVertexBuffer, 0, faceVertexScratch);
-      device.queue.writeBuffer(edgeVertexBuffer, 0, edgeVertexScratch);
-      edgeVertexCount = eCursor / 3;
+      device.queue.writeBuffer(lineInstanceBuffer, 0, edgeVertexScratch);
+      lineInstanceCount = instCursor / 6;
     }
 
     function computeFaceDepth(faceIndex) {
@@ -549,7 +620,6 @@
       state.lastFrame = now;
       state.spin += config.rotSpeed * dt;
 
-      twinkleBackground();
       updateSpriteBuffer();
       updateUniformBuffer();
       rebuildBuffers();
@@ -558,13 +628,7 @@
       requestAnimationFrame(frame);
     }
 
-    function twinkleBackground() {
-      for (const star of sprites.stars) {
-        if (Math.random() < 0.02) {
-          star.intensity = 0.4 + Math.random() * 0.6;
-        }
-      }
-    }
+    // Stars are intentionally non-flickering; keep background stable.
 
     function updateUniformBuffer() {
       const theta = state.spin + config.baseAzim;
@@ -577,14 +641,14 @@
       uniformArray.set(config.edgeColor, 24);
       const width = canvas.width;
       const height = canvas.height;
-      uniformArray.set([width, height, config.maxDepth, 0], 28);
+      uniformArray.set([width, height, config.maxDepth, config.edgeWidthPx], 28);
       device.queue.writeBuffer(uniformBuffer, 0, uniformArray.buffer);
     }
 
     function drawScene() {
       const commandEncoder = device.createCommandEncoder();
       const textureView = context.getCurrentTexture().createView();
-      const renderPass = commandEncoder.beginRenderPass({
+      const ringPass = commandEncoder.beginRenderPass({
         colorAttachments: [
           {
             view: textureView,
@@ -595,22 +659,36 @@
         ],
       });
 
-      renderPass.setBindGroup(0, uniformBindGroup);
+      ringPass.setBindGroup(0, uniformBindGroup);
 
-      renderPass.setPipeline(facePipeline);
-      renderPass.setVertexBuffer(0, faceVertexBuffer);
-      renderPass.draw(faceVertexCount);
+      ringPass.setPipeline(facePipeline);
+      ringPass.setVertexBuffer(0, faceVertexBuffer);
+      ringPass.draw(faceVertexCount);
 
-      renderPass.setPipeline(edgePipeline);
-      renderPass.setVertexBuffer(0, edgeVertexBuffer);
-      renderPass.draw(edgeVertexCount);
+      ringPass.setPipeline(thickLinePipeline);
+      ringPass.setVertexBuffer(0, lineVertexBuffer);
+      ringPass.setVertexBuffer(1, lineInstanceBuffer);
+      ringPass.draw(6, lineInstanceCount);
 
-      renderPass.setPipeline(spritePipeline);
-      renderPass.setVertexBuffer(0, spriteVertexBuffer);
-      renderPass.setVertexBuffer(1, spriteInstanceBuffer);
-      renderPass.draw(6, spriteInstanceCount);
+      ringPass.end();
 
-      renderPass.end();
+      const spritePass = commandEncoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: textureView,
+            loadOp: "load",
+            storeOp: "store",
+          },
+        ],
+      });
+
+      spritePass.setBindGroup(0, uniformBindGroup);
+      spritePass.setPipeline(spritePipeline);
+      spritePass.setVertexBuffer(0, spriteVertexBuffer);
+      spritePass.setVertexBuffer(1, spriteInstanceBuffer);
+      spritePass.draw(6, spriteInstanceCount);
+
+      spritePass.end();
       device.queue.submit([commandEncoder.finish()]);
     }
 
@@ -710,7 +788,7 @@
           for (let l = 0; l < config.lightsPerSegment; l++) {
             const faceIdx = Math.floor(Math.random() * segment.faces.length);
             const lightSample = samplePointOnQuad(segment.vertices, segment.faces[faceIdx].indices);
-            const size = Math.random() < 0.1 ? randRange(3.0, 8.0) : randRange(0.15, 2.5);
+            const size = (Math.random() < 0.1 ? randRange(6, 8.0) : randRange(4, 5)) * config.cityLightSizeMul;
             const color = [randRange(0.4, 0.8), randRange(0, 0.25), randRange(0, 0.25)];
             cityLights.push({ position: lightSample, size, color, intensity: 1.0 });
           }
@@ -733,7 +811,7 @@
         const rgb = hsvToRgb(hue, 1.0, 1.0);
         backgroundStars.push({
           position: world,
-          size: randRange(0.5, 2.0),
+          size: randRange(0.5, 2.0) * config.starSizeMul,
           color: [rgb[0], rgb[1], rgb[2]],
           intensity: randRange(0.4, 1.0),
         });
@@ -752,7 +830,7 @@
         const rgb = hsvToRgb(hue, 0.4, 0.8);
         fixedStars.push({
           position: world,
-          size: randRange(0.5, 1.5),
+          size: randRange(0.5, 1.5) * config.starSizeMul,
           color: [rgb[0], rgb[1], rgb[2]],
           intensity: 0.6,
         });
